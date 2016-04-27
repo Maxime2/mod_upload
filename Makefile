@@ -10,3 +10,8 @@ install: all
 
 mod_upload.la: mod_upload.c
 	@$(APXS) -c -o $@ $(APXS_CFLAGS) $(APXS_LFLAGS) $(APXS_LIBS) $< --shared
+
+clean:
+	@rm -f *~ *.la *.lo *.slo
+
+dist-clean: clean
