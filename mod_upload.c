@@ -5,6 +5,11 @@
 	Current state: pre-release; some parts work, but none of it
 	is suitable for an operational server.  Subject to much change
 
+	Copyright (c) 2016, Maxim Zakharov
+	Author:	Maxim Zakharov <dp.maxime@gmail.com>
+
+	Fixes making it work.
+
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation; either version 2 of the License, or
@@ -39,6 +44,44 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 
 #define BUFLEN 8192
 #define KEEPONCLOSE APR_CREATE | APR_READ | APR_WRITE | APR_EXCL
+
+static APR_DECLARE_NONSTD(void *) apr_pmemcat(apr_pool_t *p, apr_size_t *len, ... ) {
+  va_list args;
+  void *m, *res, *cm;
+
+  *len = 0;
+
+  va_start(args, len);
+  while ((m = va_arg(args, void *)) != NULL) {
+    apr_size_t memlen = va_arg(args, apr_size_t);
+    *len += memlen;
+  }
+  va_end(args);
+
+  cm = res = (void *) apr_palloc(p, *len);
+
+  va_start(args, len);
+  while ((m = va_arg(args, void *)) != NULL) {
+    apr_size_t memlen = va_arg(args, apr_size_t);
+    if (memlen == 0) continue;
+    memcpy(cm, m, memlen);
+    cm += memlen;
+  }
+  va_end(args);
+
+  return res;
+}
+
+static void tmpfile_cleanup(apr_file_t *tmpfile) {
+  apr_finfo_t tinfo;
+
+  apr_file_datasync(tmpfile) ;
+  if (APR_SUCCESS == apr_file_info_get(&tinfo, APR_FINFO_SIZE, tmpfile)) {
+    apr_file_trunc(tmpfile, tinfo.size - 2); /* remove extra \r\n */
+  }
+
+  apr_file_close(tmpfile) ;
+}
 
 static apr_status_t tmpfile_filter(ap_filter_t *f, apr_bucket_brigade *bbout,
 	ap_input_mode_t mode, apr_read_type_e block, apr_off_t nbytes) {
@@ -151,12 +194,12 @@ static char* get_boundary(apr_pool_t* p, const char* ctype) {
 typedef struct upload_ctx {
   apr_pool_t* pool ;
   apr_table_t* form ;
-//  apr_bucket_brigade* bbin ;
   char* boundary ;
   char* key ;
   char* val ;
   char* file_field ;
   char* leftover ;
+  apr_size_t leftsize ;
   enum { p_none, p_head, p_field, p_end, p_done } parse_state ;
   char is_file ;
 } upload_ctx ;
@@ -164,7 +207,7 @@ typedef struct upload_ctx {
 static apr_status_t upload_filter_init(ap_filter_t* f) {
   upload_conf* conf = ap_get_module_config(f->r->per_dir_config,&upload_module);
   upload_ctx* ctx = apr_palloc(f->r->pool, sizeof(upload_ctx)) ;
-  // check content-type, get boundary or error
+  /* check content-type, get boundary or error */
   const char* ctype = apr_table_get(f->r->headers_in, "Content-Type") ;
 
   if ( ! ctype || ! conf->file_field ||
@@ -181,7 +224,6 @@ static apr_status_t upload_filter_init(ap_filter_t* f) {
   ctx->file_field = conf->file_field ;
   ctx->is_file = 0 ;
   ctx->leftover = 0 ;
-//  ctx->bbin = apr_brigade_create(f->r->pool, f->r->connection->bucket_alloc) ;
 
   /* save the table in request_config */
   ap_set_module_config(f->r->request_config, &upload_module, ctx->form) ;
@@ -214,6 +256,7 @@ static void set_header(upload_ctx* ctx, const char* data) {
     }
   }
 }
+
 static void set_body(upload_ctx* ctx, const char* data) {
   const char* cr = strchr(data, '\r') ;
   char* tmp = apr_pstrndup(ctx->pool, data, cr-data) ;
@@ -222,6 +265,7 @@ static void set_body(upload_ctx* ctx, const char* data) {
   else
     ctx->val = tmp ;
 }
+
 static enum { boundary_part, boundary_end, boundary_none }
 	is_boundary( upload_ctx* ctx, const char* p) {
   size_t blen = strlen(ctx->boundary) ;
@@ -236,6 +280,7 @@ static enum { boundary_part, boundary_end, boundary_none }
   else
 	return boundary_part ;
 }
+
 static void end_body(upload_ctx* ctx) {
   if ( ! ctx->is_file )
     apr_table_set(ctx->form, ctx->key, ctx->val) ;
@@ -244,16 +289,19 @@ static void end_body(upload_ctx* ctx) {
 
   ctx->key = ctx->val = 0 ;
 }
+
 static apr_status_t upload_filter(ap_filter_t *f, apr_bucket_brigade *bbout,
 	ap_input_mode_t mode, apr_read_type_e block, apr_off_t nbytes) {
 
   char* buf = 0 ;
   char* p = buf ;
   char* e ;
+  const char* cl_header = apr_table_get(f->r->headers_in, "Content-Length") ;
  
   int ret = APR_SUCCESS ;
  
   apr_size_t bytes = 0 ;
+  apr_off_t readbytes = (cl_header) ? (apr_off_t) apr_atoi64(cl_header) : nbytes ;
   apr_bucket* b ;
   apr_bucket_brigade* bbin ;
  
@@ -287,15 +335,20 @@ static apr_status_t upload_filter(ap_filter_t *f, apr_bucket_brigade *bbout,
     } else if ( apr_bucket_read(b, &ptr, &bytes, APR_BLOCK_READ)
 		== APR_SUCCESS ) {
       const char* p = ptr ;
-      while ( e = strchr(p, '\n'), ( e && ( e < (ptr+bytes) ) ) ) {
+      if (ctx->leftover) {
+	apr_size_t new_bytes ;
+	p = apr_pmemcat(f->r->pool, &new_bytes, ctx->leftover, ctx->leftsize, ptr, bytes, NULL) ;
+	ctx->leftover = NULL ;
+	ctx->leftsize = 0 ;
+	bytes = new_bytes ;
+	ptr = p;
+      }
+      while ( e = memchr(p, (int)'\n', bytes - (p - ptr)), ( e && ( e < (ptr+bytes) ) ) ) {
 	const char* ptmp = p ;
+	apr_size_t ptmplen = (e - p) ;
+	int hasr = (ptmplen && ptmp[ptmplen - 1] == '\r') ? 1 : 0 ;
 	*e = 0 ;
-	if ( ctx->leftover ) {
-		// this'll be grossly inefficient if we get lots of
-		// little buckets (we don't in my setup:-)
-	  ptmp = apr_pstrcat(f->r->pool, ctx->leftover, p, NULL) ;
-	  ctx->leftover = 0 ;
-	}
+	if (hasr) ptmplen--,*(--e) = 0 ;
 	switch ( ctx->parse_state ) {
 	  case p_none:
 	    if ( is_boundary(ctx, ptmp) == boundary_part )
@@ -319,8 +372,9 @@ static apr_status_t upload_filter(ap_filter_t *f, apr_bucket_brigade *bbout,
 		break ;
 	      case boundary_none:
 		if ( ctx->is_file ) {
-		  apr_brigade_puts(bbout, ap_filter_flush, f, ptmp) ;
-		  apr_brigade_putc(bbout, ap_filter_flush, f, '\n') ;
+		  apr_brigade_write(bbout, NULL, NULL, ptmp, ptmplen) ;
+		  if (hasr) apr_brigade_putc(bbout, NULL, NULL, '\r') ;
+		  apr_brigade_putc(bbout, NULL, NULL, '\n') ;
 		} else
 		  set_body(ctx, ptmp) ;
 		break ;
@@ -333,15 +387,17 @@ static apr_status_t upload_filter(ap_filter_t *f, apr_bucket_brigade *bbout,
 	  case p_done:
 	    break ;
 	}
-	if ( e - ptr >= bytes )
+	if ( e - ptr >= bytes - hasr )
 	  break ;
 	p = e + 1 ;
+	if (hasr) p++;
       }
       if ( ( ctx->parse_state != p_end ) && ( ctx->parse_state != p_done ) ) {
 	size_t bleft = bytes - (p-ptr) ;
-	ctx->leftover = apr_pstrndup(f->r->pool, p, bleft ) ;
+	ctx->leftover = apr_pmemdup(f->r->pool, p, bleft ) ;
+	ctx->leftsize = bleft;
 #ifdef DEBUG
-  ap_log_rerror(APLOG_MARK,APLOG_DEBUG,0, f->r, "leftover %d bytes\n\t%s\n\t%s\n", bleft, ctx->leftover, p) ;
+	ap_log_rerror(APLOG_MARK,APLOG_CRIT,0, f->r, "upload_filter: leftover %ld bytes", ctx->leftsize) ;
 #endif
       }
     }
